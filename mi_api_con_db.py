@@ -3,13 +3,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from typing import List, Optional
-from jose import JWTError, jwt
-from passlib.context import CryptContext
-from datetime import datetime, timedelta
 import os
 import re
-import psycopg2  # ✅ Con 'psy'
-from psycopg2.extras import RealDictCursor
+import psycopg2  # ✅ CORRECTO (con 'psy')
+from psycopg2.extras import RealDictCursor  # ✅ CORRECTO (con 'psy')
 
 # --- Configuración JWT ---
 SECRET_KEY = "mi-clave-secreta-super-segura-cambiar-en-produccion"
