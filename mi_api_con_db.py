@@ -8,7 +8,7 @@ from passlib.context import CryptContext
 from datetime import datetime, timedelta
 import os
 import re
-import psycopg2
+import psycopg2  # ✅ Con 'psy'
 from psycopg2.extras import RealDictCursor
 
 # --- Configuración JWT ---
