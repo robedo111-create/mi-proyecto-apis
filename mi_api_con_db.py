@@ -3,23 +3,24 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from typing import List, Optional
-import sqlite3
-import os
-from datetime import datetime, timedelta
 from jose import JWTError, jwt
 from passlib.context import CryptContext
+from datetime import datetime, timedelta
+import os
 import re
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 # --- Configuración JWT ---
 SECRET_KEY = "mi-clave-secreta-super-segura-cambiar-en-produccion"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
-# --- Configuración de seguridad ---
+# --- Seguridad ---
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-app = FastAPI(title="Mi API con Autenticación")
+app = FastAPI(title="Mi API con PostgreSQL y Autenticación")
 
 # --- CORS ---
 app.add_middleware(
@@ -30,32 +31,36 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Base de datos SQLite ---
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'posts.db')
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-cursor = conn.cursor()
+# --- CONEXIÓN A POSTGRESQL ---
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Crear tablas si no existen
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS posts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT NOT NULL,
-        body TEXT NOT NULL,
-        userId INTEGER NOT NULL
-    )
-''')
+if not DATABASE_URL:
+    print("ADVERTENCIA: La variable DATABASE_URL no está configurada.")
+    raise Exception("DATABASE_URL no está configurada")
 
-# Tabla de usuarios
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        email TEXT UNIQUE NOT NULL,
-        hashed_password TEXT NOT NULL
-    )
-''')
-conn.commit()
+conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
-# --- Modelos ---
+# --- Crear tablas si no existen ---
+with conn.cursor() as cur:
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            email VARCHAR(255) UNIQUE NOT NULL,
+            hashed_password TEXT NOT NULL
+        )
+    ''')
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS posts (
+            id SERIAL PRIMARY KEY,
+            title VARCHAR(255) NOT NULL,
+            body TEXT NOT NULL,
+            "userId" INTEGER NOT NULL,
+            CONSTRAINT fk_user FOREIGN KEY("userId") REFERENCES users(id)
+        )
+    ''')
+    conn.commit()
+
+# --- Modelos Pydantic ---
 class PostCreate(BaseModel):
     title: str
     body: str
@@ -83,11 +88,9 @@ def get_password_hash(password):
     return pwd_context.hash(password)
 
 def get_user_by_email(email: str):
-    cursor.execute("SELECT id, email, hashed_password FROM users WHERE email = ?", (email,))
-    user = cursor.fetchone()
-    if user:
-        return {"id": user[0], "email": user[1], "hashed_password": user[2]}
-    return None
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, email, hashed_password FROM users WHERE email = %s", (email,))
+        return cur.fetchone()
 
 def authenticate_user(email: str, password: str):
     user = get_user_by_email(email)
@@ -104,8 +107,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     else:
         expire = datetime.utcnow() + timedelta(minutes=15)
     to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 async def get_current_user(token: str = Depends(oauth2_scheme)):
     credentials_exception = HTTPException(
@@ -127,28 +129,24 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     return user
 
 # --- ENDPOINTS DE AUTENTICACIÓN ---
-
 @app.post("/register", response_model=Token)
 def register(user: UserCreate):
-    # Validar email
     if not re.match(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", user.email):
         raise HTTPException(status_code=400, detail="Email inválido")
     if len(user.password) < 6:
         raise HTTPException(status_code=400, detail="La contraseña debe tener al menos 6 caracteres")
     
-    # Verificar si el usuario ya existe
     if get_user_by_email(user.email):
         raise HTTPException(status_code=400, detail="El usuario ya existe")
     
-    # Crear usuario
     hashed = get_password_hash(user.password)
-    cursor.execute(
-        "INSERT INTO users (email, hashed_password) VALUES (?, ?)",
-        (user.email, hashed)
-    )
-    conn.commit()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO users (email, hashed_password) VALUES (%s, %s) RETURNING id",
+            (user.email, hashed)
+        )
+        conn.commit()
     
-    # Crear token
     access_token = create_access_token(data={"sub": user.email})
     return {"access_token": access_token, "token_type": "bearer"}
 
@@ -169,51 +167,53 @@ def get_current_user_info(current_user: dict = Depends(get_current_user)):
     return {"id": current_user["id"], "email": current_user["email"]}
 
 # --- ENDPOINTS DE POSTS (protegidos) ---
-
 @app.get("/posts", response_model=List[PostResponse])
 def obtener_posts(current_user: dict = Depends(get_current_user)):
-    cursor.execute("SELECT * FROM posts")
-    posts = cursor.fetchall()
-    return [{"id": row[0], "title": row[1], "body": row[2], "userId": row[3]} for row in posts]
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, title, body, \"userId\" FROM posts")
+        return cur.fetchall()
 
 @app.get("/posts/{post_id}", response_model=PostResponse)
 def obtener_post(post_id: int, current_user: dict = Depends(get_current_user)):
-    cursor.execute("SELECT * FROM posts WHERE id = ?", (post_id,))
-    post = cursor.fetchone()
-    if not post:
-        raise HTTPException(status_code=404, detail="Post no encontrado")
-    return {"id": post[0], "title": post[1], "body": post[2], "userId": post[3]}
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, title, body, \"userId\" FROM posts WHERE id = %s", (post_id,))
+        post = cur.fetchone()
+        if not post:
+            raise HTTPException(status_code=404, detail="Post no encontrado")
+        return post
 
 @app.post("/posts", response_model=PostResponse, status_code=201)
 def crear_post(post: PostCreate, current_user: dict = Depends(get_current_user)):
-    cursor.execute(
-        "INSERT INTO posts (title, body, userId) VALUES (?, ?, ?)",
-        (post.title, post.body, post.userId)
-    )
-    conn.commit()
-    nuevo_id = cursor.lastrowid
-    return {"id": nuevo_id, "title": post.title, "body": post.body, "userId": post.userId}
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO posts (title, body, \"userId\") VALUES (%s, %s, %s) RETURNING id, title, body, \"userId\"",
+            (post.title, post.body, post.userId)
+        )
+        conn.commit()
+        return cur.fetchone()
 
 @app.put("/posts/{post_id}", response_model=PostResponse)
 def actualizar_post(post_id: int, post: PostCreate, current_user: dict = Depends(get_current_user)):
-    cursor.execute(
-        "UPDATE posts SET title = ?, body = ?, userId = ? WHERE id = ?",
-        (post.title, post.body, post.userId, post_id)
-    )
-    conn.commit()
-    if cursor.rowcount == 0:
-        raise HTTPException(status_code=404, detail="Post no encontrado")
-    return {"id": post_id, "title": post.title, "body": post.body, "userId": post.userId}
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE posts SET title = %s, body = %s, \"userId\" = %s WHERE id = %s RETURNING id, title, body, \"userId\"",
+            (post.title, post.body, post.userId, post_id)
+        )
+        conn.commit()
+        updated = cur.fetchone()
+        if not updated:
+            raise HTTPException(status_code=404, detail="Post no encontrado")
+        return updated
 
 @app.delete("/posts/{post_id}")
 def eliminar_post(post_id: int, current_user: dict = Depends(get_current_user)):
-    cursor.execute("DELETE FROM posts WHERE id = ?", (post_id,))
-    conn.commit()
-    if cursor.rowcount == 0:
-        raise HTTPException(status_code=404, detail="Post no encontrado")
-    return {"mensaje": f"Post {post_id} eliminado"}
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM posts WHERE id = %s", (post_id,))
+        conn.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Post no encontrado")
+        return {"mensaje": f"Post {post_id} eliminado"}
 
-# --- Endpoint raíz ---
 @app.get("/")
 def root():
-    return {"mensaje": "API con autenticación funcionando. Ve a /docs para probarla"}
+    return {"mensaje": "API con PostgreSQL y Autenticación funcionando. Ve a /docs para probarla"}
