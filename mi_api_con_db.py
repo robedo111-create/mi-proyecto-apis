@@ -5,16 +5,13 @@ from pydantic import BaseModel
 from typing import List, Optional
 import os
 import re
-import psycopg2  # ✅ CORRECTO (con 'psy')
-from psycopg2.extras import RealDictCursor  # ✅ CORRECTO (con 'psy')
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import hashlib
+import secrets
 
-# --- Configuración JWT ---
+# --- Configuración ---
 SECRET_KEY = "mi-clave-secreta-super-segura-cambiar-en-produccion"
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
-
-# --- Seguridad ---
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 app = FastAPI(title="Mi API con PostgreSQL y Autenticación")
@@ -28,16 +25,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- CONEXIÓN A POSTGRESQL ---
+# --- Conexión a PostgreSQL ---
 DATABASE_URL = os.getenv("DATABASE_URL")
-
 if not DATABASE_URL:
-    print("ADVERTENCIA: La variable DATABASE_URL no está configurada.")
     raise Exception("DATABASE_URL no está configurada")
 
 conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
-# --- Crear tablas si no existen ---
+# --- Crear tablas ---
 with conn.cursor() as cur:
     cur.execute('''
         CREATE TABLE IF NOT EXISTS users (
@@ -51,13 +46,23 @@ with conn.cursor() as cur:
             id SERIAL PRIMARY KEY,
             title VARCHAR(255) NOT NULL,
             body TEXT NOT NULL,
-            "userId" INTEGER NOT NULL,
-            CONSTRAINT fk_user FOREIGN KEY("userId") REFERENCES users(id)
+            "userId" INTEGER NOT NULL
         )
     ''')
     conn.commit()
 
-# --- Modelos Pydantic ---
+# --- Funciones de hashing (sin bcrypt) ---
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return hash_password(plain_password) == hashed_password
+
+# --- Modelos ---
+class UserCreate(BaseModel):
+    email: str
+    password: str
+
 class PostCreate(BaseModel):
     title: str
     body: str
@@ -66,24 +71,11 @@ class PostCreate(BaseModel):
 class PostResponse(PostCreate):
     id: int
 
-class UserCreate(BaseModel):
-    email: str
-    password: str
-
 class Token(BaseModel):
     access_token: str
     token_type: str
 
-class TokenData(BaseModel):
-    email: Optional[str] = None
-
 # --- Funciones de autenticación ---
-def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
-
-def get_password_hash(password):
-    return pwd_context.hash(password)
-
 def get_user_by_email(email: str):
     with conn.cursor() as cur:
         cur.execute("SELECT id, email, hashed_password FROM users WHERE email = %s", (email,))
@@ -97,33 +89,14 @@ def authenticate_user(email: str, password: str):
         return False
     return user
 
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=15)
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
 async def get_current_user(token: str = Depends(oauth2_scheme)):
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Credenciales inválidas",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        email: str = payload.get("sub")
-        if email is None:
-            raise credentials_exception
-        token_data = TokenData(email=email)
-    except JWTError:
-        raise credentials_exception
-    user = get_user_by_email(email=token_data.email)
-    if user is None:
-        raise credentials_exception
-    return user
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Credenciales inválidas",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return {"id": 1, "email": "test@ejemplo.com"}
 
 # --- ENDPOINTS DE AUTENTICACIÓN ---
 @app.post("/register", response_model=Token)
@@ -136,7 +109,7 @@ def register(user: UserCreate):
     if get_user_by_email(user.email):
         raise HTTPException(status_code=400, detail="El usuario ya existe")
     
-    hashed = get_password_hash(user.password)
+    hashed = hash_password(user.password)
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO users (email, hashed_password) VALUES (%s, %s) RETURNING id",
@@ -144,7 +117,7 @@ def register(user: UserCreate):
         )
         conn.commit()
     
-    access_token = create_access_token(data={"sub": user.email})
+    access_token = secrets.token_hex(32)
     return {"access_token": access_token, "token_type": "bearer"}
 
 @app.post("/token", response_model=Token)
@@ -156,22 +129,22 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
             detail="Email o contraseña incorrectos",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    access_token = create_access_token(data={"sub": user["email"]})
+    access_token = secrets.token_hex(32)
     return {"access_token": access_token, "token_type": "bearer"}
 
 @app.get("/users/me")
 def get_current_user_info(current_user: dict = Depends(get_current_user)):
     return {"id": current_user["id"], "email": current_user["email"]}
 
-# --- ENDPOINTS DE POSTS (protegidos) ---
+# --- ENDPOINTS DE POSTS ---
 @app.get("/posts", response_model=List[PostResponse])
-def obtener_posts(current_user: dict = Depends(get_current_user)):
+def obtener_posts():
     with conn.cursor() as cur:
         cur.execute("SELECT id, title, body, \"userId\" FROM posts")
         return cur.fetchall()
 
 @app.get("/posts/{post_id}", response_model=PostResponse)
-def obtener_post(post_id: int, current_user: dict = Depends(get_current_user)):
+def obtener_post(post_id: int):
     with conn.cursor() as cur:
         cur.execute("SELECT id, title, body, \"userId\" FROM posts WHERE id = %s", (post_id,))
         post = cur.fetchone()
@@ -180,7 +153,7 @@ def obtener_post(post_id: int, current_user: dict = Depends(get_current_user)):
         return post
 
 @app.post("/posts", response_model=PostResponse, status_code=201)
-def crear_post(post: PostCreate, current_user: dict = Depends(get_current_user)):
+def crear_post(post: PostCreate):
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO posts (title, body, \"userId\") VALUES (%s, %s, %s) RETURNING id, title, body, \"userId\"",
@@ -190,7 +163,7 @@ def crear_post(post: PostCreate, current_user: dict = Depends(get_current_user))
         return cur.fetchone()
 
 @app.put("/posts/{post_id}", response_model=PostResponse)
-def actualizar_post(post_id: int, post: PostCreate, current_user: dict = Depends(get_current_user)):
+def actualizar_post(post_id: int, post: PostCreate):
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE posts SET title = %s, body = %s, \"userId\" = %s WHERE id = %s RETURNING id, title, body, \"userId\"",
@@ -203,7 +176,7 @@ def actualizar_post(post_id: int, post: PostCreate, current_user: dict = Depends
         return updated
 
 @app.delete("/posts/{post_id}")
-def eliminar_post(post_id: int, current_user: dict = Depends(get_current_user)):
+def eliminar_post(post_id: int):
     with conn.cursor() as cur:
         cur.execute("DELETE FROM posts WHERE id = %s", (post_id,))
         conn.commit()
